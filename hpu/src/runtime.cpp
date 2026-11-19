@@ -60,7 +60,8 @@ namespace detail {
 struct DeviceState {
     synDeviceId id = 0;
     AllocationBudget hbm,pinned;
-    explicit DeviceState(std::optional<uint32_t> module_id) {
+    explicit DeviceState(std::optional<uint32_t> module_id, const std::string& pci_bus) {
+        if(module_id && !pci_bus.empty()) throw std::invalid_argument("choose one of a PCI address and a module ID");
         std::lock_guard lock(lifecycle_mutex);
         if (acquired_session)
             throw std::logic_error("one acquired Device per process; copy the existing Device to share it");
@@ -71,13 +72,21 @@ struct DeviceState {
         check(synInitialize(), "synInitialize (one acquired Device per process)");
         bool acquired = false;
         try {
-            if (module_id)
+            if (!pci_bus.empty())
+                check(synDeviceAcquire(&id, pci_bus.c_str()), "synDeviceAcquire by PCI address");
+            else if (module_id)
                 check(synDeviceAcquireByModuleId(&id, *module_id), "synDeviceAcquireByModuleId");
             else
                 check(synDeviceAcquireByDeviceType(&id, synDeviceGaudi2), "synDeviceAcquireByDeviceType Gaudi2");
             acquired = true;
             synDeviceInfo info{};
             check(synDeviceGetInfo(id, &info), "synDeviceGetInfo");
+            if (!pci_bus.empty()) {
+                char actual[64] = {};
+                check(synDeviceGetPCIBusId(actual, sizeof(actual), id), "synDeviceGetPCIBusId");
+                if (pci_bus != actual) throw std::runtime_error("requested PCI device " + pci_bus + ", acquired " + actual);
+                std::fprintf(stderr, "strata-hpu: acquired Gaudi2 at %s\n", actual);
+            }
             if (info.deviceType != synDeviceGaudi2)
                 throw std::runtime_error("this backend currently supports Gaudi2 only");
             acquired_session = true;
@@ -108,7 +117,8 @@ bool drain(const std::shared_ptr<detail::DeviceState>& state) noexcept {
 }
 }
 
-Device::Device(std::optional<uint32_t> module_id) : state_(std::make_shared<detail::DeviceState>(module_id)) {}
+Device::Device(std::optional<uint32_t> module_id, const std::string& pci_bus)
+    : state_(std::make_shared<detail::DeviceState>(module_id, pci_bus)) {}
 DeviceInfo Device::info() const {
     DeviceInfo value;
     value.id = state_->id;

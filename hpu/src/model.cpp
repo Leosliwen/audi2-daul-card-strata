@@ -1,4 +1,5 @@
 #include "strata/hpu/model.hpp"
+#include "pipeline_stage.hpp"
 #include "strata/hpu/simd_norm.hpp"
 #include "strata/hpu/performance_modes.hpp"
 #include "strata/hpu/moe_mme.hpp"
@@ -147,6 +148,7 @@ struct Model::Impl {
     std::unique_ptr<HostRecipe> control_recipe;
     std::unique_ptr<PleInput> ple;
     std::vector<std::unique_ptr<Layer>> layers;
+    std::unique_ptr<PipelineStage> pipeline;
     // Destroy shared recipes before the layer weights they last borrowed.
     std::unique_ptr<HcWindow> hc_window;
     std::unique_ptr<GdnWindow> gdn_window;
@@ -171,6 +173,25 @@ struct Model::Impl {
         memory_plan(plan_model(table,options.memory,ple_mode.external,options.ple_io,ple_mode.enabled)),
         positions(options.vision?uint64_t(options.memory.context)+64:0) {
         validate_ple_io_policy(options.ple_io);
+        if(options.module_id && !options.pci_bus.empty())
+            throw std::invalid_argument("--module and --pci are mutually exclusive");
+        if(options.pipeline_peer_pci.empty() != (options.pipeline_split_layer==0))
+            throw std::invalid_argument("--pipeline-peer-pci and --pipeline-split-layer must be supplied together");
+        if(options.pipeline_split_layer) {
+            if(options.pci_bus.empty() || options.pci_bus==options.pipeline_peer_pci ||
+               options.pipeline_split_layer<2 || options.pipeline_split_layer>=table.geometry().n_layers)
+                throw std::invalid_argument("Gaudi2 pipeline requires two distinct PCI addresses and a split in layers 2..n_layers-1");
+            if(options.fp8_experts || options.memory.prefill_rows || options.prefill_auto ||
+               options.memory.verify_rows || options.memory.snapshot_budget || options.memory.batch_slots ||
+               options.vision || !options.control_vector.files.empty() || !options.expert_profile.profile.empty() ||
+               !options.expert_profile.save.empty() || options.expert_profile.adapt ||
+               options.capture_layer_ladder || options.capture_routing || options.capture_halves ||
+               !options.mtp_runtime.empty() || options.hpu_load_budget!=UINT32_MAX ||
+               options.residency.resident_cpu_experts ||
+               options.residency.expert_cache_per_layer || resident_iq4_enabled() || chain_decode_enabled() ||
+               std::getenv("STRATA_HPU_DFLASH"))
+                throw std::invalid_argument("Gaudi2 pipeline requires scalar text inference with packed experts and without snapshots, batching, tracing or speculative decoding");
+        }
         parse_layer_windows(std::getenv("STRATA_HPU_PREFILL_LAYERS"));
         if(tpc_colpair_enabled() && (!tpc_experts_enabled() || !direct_experts_enabled() || !options.fp8_experts ||
            tpc_hilo_enabled() || options.memory.prefill_rows || options.prefill_auto || !options.mtp_runtime.empty() ||
@@ -809,6 +830,34 @@ Model::Model(const std::string& path,ModelOptions options) {
     // Complete schema and payload plan are checked before device acquisition.
     auto p=std::make_unique<Impl>(path,std::move(options));const auto& g=p->table.geometry();const auto& m=p->options.memory;
     auto qconfig=qsa_config(g,m.context,m.page_size);qconfig.kv=m.kv_mode;qconfig.position_base=p->options.position_base;qconfig.rope=p->rope;qconfig.validate();
+    const uint32_t local_layers=p->options.pipeline_split_layer?p->options.pipeline_split_layer:uint32_t(g.n_layers);
+    if(p->options.pipeline_split_layer) {
+        // Start the peer before initializing Synapse or opening the parent PLE reader.
+        p->pipeline=std::make_unique<PipelineStage>(uint64_t(g.n_embd)*g.hc,[&] {
+            PipelineStage::Resources resources;
+            resources.device=std::make_unique<Device>(std::nullopt,p->options.pipeline_peer_pci);
+            const auto available=resources.device->info().free_bytes;
+            if(m.driver_margin>available || m.hbm_limit>available-m.driver_margin)
+                throw std::runtime_error("peer HBM cap plus driver margin exceeds available memory");
+            resources.device->allocation_limits(m.hbm_limit,m.pinned_limit);
+            resources.cache=std::make_unique<ExpertCache>(*resources.device,p->table,m.expert_cache,m.staging,p->expert_pack);
+            for(uint32_t layer=local_layers;layer<uint64_t(g.n_layers);++layer) {
+                LayerOptions o;
+                o.context=m.context;
+                o.page_size=m.page_size;
+                o.kv=m.kv_mode;
+                o.staging_budget=m.staging;
+                o.dense_payload_budget=p->memory_plan.layer_dense_bytes[layer];
+                o.position_base=p->options.position_base;
+                o.rope=p->rope;
+                o.positions=&p->positions;
+                o.ple_enabled=p->ple_mode.enabled;
+                resources.layers.push_back(std::make_unique<Layer>(*resources.device,p->table,layer,*resources.cache,o));
+            }
+            std::fprintf(stderr,"strata-hpu: pipeline peer loaded layers [%u,%u)\n",local_layers,uint32_t(g.n_layers));
+            return resources;
+        });
+    }
     // --no-ple keeps the model free of any PLE table: there is no gather, no reader reservation and the
     // layer-1 PLE weights were not priced or loaded (model_plan.cpp).
     if(p->ple_mode.enabled)
@@ -836,7 +885,7 @@ Model::Model(const std::string& path,ModelOptions options) {
         throw std::invalid_argument("this build has STRATA_HPU_CPU_EXPERTS=OFF");
 #endif
     }
-    p->device=std::make_unique<Device>(p->options.module_id);
+    p->device=std::make_unique<Device>(p->options.module_id,p->options.pci_bus);
     const auto available=p->device->info().free_bytes;
     if(m.driver_margin>available || m.hbm_limit>available-m.driver_margin) throw std::runtime_error("requested HBM cap plus driver margin exceeds available memory");
     p->device->allocation_limits(m.hbm_limit,m.pinned_limit);
@@ -873,7 +922,7 @@ Model::Model(const std::string& path,ModelOptions options) {
         p->control_recipe=std::make_unique<HostRecipe>(*p->device,graph.compile("strata_control_vector"),std::span<const Binding>{},std::vector<std::string>{"out"});
     }
     if(p->mtp_source) p->mtp=std::make_unique<MtpBlock>(*p->device,*p->mtp_source,p->head_weights->binding("weight"),p->options.mtp,p->table.matrix("output.weight"));
-    for(uint32_t layer=0;layer<uint64_t(g.n_layers);++layer) {
+    for(uint32_t layer=0;layer<local_layers;++layer) {
         LayerOptions o;o.context=m.context;o.page_size=m.page_size;o.kv=m.kv_mode;o.staging_budget=m.staging;o.dense_payload_budget=p->memory_plan.layer_dense_bytes[layer];
         o.position_base=p->options.position_base;o.rope=p->rope;o.positions=&p->positions;o.fused_decode=p->options.fp8_experts && !std::getenv("STRATA_HPU_UNFUSED"); // env: A/B against the per-stage path
 #if STRATA_HPU_CPU_EXPERTS
@@ -900,6 +949,7 @@ Model::Model(const std::string& path,ModelOptions options) {
         }
         p->layers.push_back(std::make_unique<Layer>(*p->device,p->table,layer,*p->cache,o));
     }
+    if(p->pipeline) std::fprintf(stderr,"strata-hpu: pipeline primary loaded layers [0,%u)\n",local_layers);
     auto* state=p.get();SessionOperations op;
     op.embedding=[state,h](int32_t token) {
         // The position a positional row file claims comes from the window the owning call opened
@@ -915,6 +965,11 @@ Model::Model(const std::string& path,ModelOptions options) {
     if(state->ple) op.ple=[state](int32_t token,std::span<const int32_t> previous) {return state->ple->gather(token,previous);};
     op.checkpoint=[state](uint32_t layer) {
         if(layer==state->layers.size()) {
+            if(state->pipeline) {
+                auto rewind=std::function<void()>([state]{state->pipeline->restore();});
+                state->pipeline->checkpoint();
+                return rewind;
+            }
             auto point=state->mtp->checkpoint();return std::function<void()>([state,point=std::move(point)]{state->mtp->restore(point);});
         }
         auto point=state->layers.at(layer)->checkpoint();
@@ -932,6 +987,7 @@ Model::Model(const std::string& path,ModelOptions options) {
                 std::copy(output.begin(),output.end(),state->ladder.begin()+size_t(layer+1)*width);
             return output;
         }
+        if(state->pipeline) return state->pipeline->decode(residual);
         // This auxiliary transaction stage runs after the 48 target layers.
         // Its rewind joins the same SessionFlow transaction, including a failed
         // target head or post-head cancellation. Allocate passthrough first.
@@ -993,7 +1049,11 @@ Model::Model(const std::string& path,ModelOptions options) {
         if(state->control_vectors->mode()==ControlVectorMode::Project) {const std::array<float,1> negative{-state->control_vectors->scale(layer)};graph.set("negative_scale",negative);}
         graph.run();return graph.values("out");
     };
-    op.reset_layer=[state](uint32_t layer) {if(layer==state->layers.size()) state->mtp->reset();else state->layers.at(layer)->reset();};
+    op.reset_layer=[state](uint32_t layer) {
+        if(layer<state->layers.size()) state->layers.at(layer)->reset();
+        else if(state->pipeline) state->pipeline->reset();
+        else state->mtp->reset();
+    };
     // STRATA_HPU_CHAIN: every layer fused, nothing that needs a host residual between layers (MTP stage,
     // control vectors, the --dump-layers ladder). Same graphs as the per-layer path, ordered on one stream.
     bool chain=chain_decode_enabled() && !p->mtp && !p->control_vectors && p->ladder.empty();
@@ -1100,7 +1160,7 @@ Model::Model(const std::string& path,ModelOptions options) {
             }
         };
     }
-    p->flow=std::make_unique<SessionFlow>(uint32_t(h),uint32_t(g.hc),uint32_t(g.n_layers)+bool(p->mtp),uint32_t(g.n_vocab),m.context,std::move(op));impl_=std::move(p);
+    p->flow=std::make_unique<SessionFlow>(uint32_t(h),uint32_t(g.hc),local_layers+bool(p->mtp || p->pipeline),uint32_t(g.n_vocab),m.context,std::move(op));impl_=std::move(p);
 }
 Model::~Model()=default;
 std::vector<float> Model::decode(int32_t token,const std::function<bool()>& cancelled,const RoutingWindowSink& routing) {

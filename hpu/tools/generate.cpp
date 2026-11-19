@@ -105,7 +105,8 @@ int main(int argc,char** argv) {
             if(key=="--version"||key=="-V") { std::cout<<version_line()<<"\n"; return 0; }
             if(key=="--help") {
                 std::cout<<"strata-hpu --native any-shard.gguf [--plan | --serve | --tokens 1,2,3 | --tokens-file FILE --max-new 32]\n"
-                            "  --max-context N --module ID --expert-cache-mib N --hbm-limit-mib N\n"
+                            "  --max-context N --module ID | --pci BDF --expert-cache-mib N --hbm-limit-mib N\n"
+                            "  --pipeline-peer-pci BDF --pipeline-split-layer N (experimental, scalar inference)\n"
                             "  --pinned-limit-mib N --host-limit-mib N --sampling key=value\n"
                             "  --kv fp16|int8|q4_0|k8v4 (k8v4 = unrotated INT8 K + rotated Q4_0 V, its drafter runs INT8)\n"
                             "  --kv-mib MIB --kv-grow | --no-kv-grow --kv-resident N (env STRATA_KV_GROW wins)\n"
@@ -256,6 +257,9 @@ int main(int argc,char** argv) {
             else if(key=="--max-new") max_new=number<uint32_t>(value());
             else if(key=="--max-context") options.memory.context=number<uint32_t>(value());
             else if(key=="--module") options.module_id=number<uint32_t>(value());
+            else if(key=="--pci") options.pci_bus=value();
+            else if(key=="--pipeline-peer-pci") options.pipeline_peer_pci=value();
+            else if(key=="--pipeline-split-layer") options.pipeline_split_layer=number<uint32_t>(value());
             else if(key=="--expert-cache-mib") options.memory.expert_cache=checked_product(number<uint64_t>(value()),1ull<<20);
             else if(key=="--hbm-limit-mib") options.memory.hbm_limit=checked_product(number<uint64_t>(value()),1ull<<20);
             else if(key=="--pinned-limit-mib") options.memory.pinned_limit=checked_product(number<uint64_t>(value()),1ull<<20);

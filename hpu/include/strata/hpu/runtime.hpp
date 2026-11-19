@@ -24,7 +24,7 @@ struct DeviceInfo {
 class Device {
 public:
     // AIP index and physical module ID are different. Default to an available Gaudi2.
-    explicit Device(std::optional<uint32_t> module_id = std::nullopt);
+    explicit Device(std::optional<uint32_t> module_id = std::nullopt, const std::string& pci_bus = {});
     DeviceInfo info() const;
     void synchronize() const;
     // Before any buffers are allocated. Caps requested native buffer bytes;

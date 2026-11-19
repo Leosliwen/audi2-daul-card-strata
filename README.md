@@ -1,3 +1,21 @@
+# Dual Gaudi2 Strata
+
+This fork adds a two-process, layer-split pipeline for Qwen3.8-Flash-Next. Select two distinct PCI bus addresses even if both cards report the same module ID. The primary owns embeddings, PLE and the language-model head. Each process owns the layers and expert cache on its card. The stage boundary transfers FP32 residuals through a local socket.
+
+Build the native backend as described below. For the scalar baseline, point `MODEL` at the first GGUF shard, set `PRIMARY_PCI` and `PEER_PCI` to the full PCI addresses from your system, and run:
+
+```sh
+strata-hpu --native "$MODEL" --pci "$PRIMARY_PCI" --pipeline-peer-pci "$PEER_PCI" \
+  --pipeline-split-layer 24 --max-context 4096 --prefill-reference \
+  --prompt-cache 0 --snapshot-budget-mib 0 --expert-cache-mib 61440 \
+  --hbm-limit-mib 90112 --pinned-limit-mib 2048 --host-limit-mib 196608 \
+  --ple-io ram --tokens 1,2 --max-new 2 --check-logits
+```
+
+These are example budgets for 96 GiB cards. The baseline uses packed experts and scalar text inference. Dual-card IQ4 was checked against single-card logits on a short prompt. Full Q8 generation requires separate verification.
+
+## Upstream single-card documentation
+
 <div align="center">
 
 # Strata on a Single Gaudi2

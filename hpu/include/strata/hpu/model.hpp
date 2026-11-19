@@ -18,6 +18,9 @@ struct ModelOptions {
     ModelMemoryOptions memory;
     bool prefill_auto=false; // resolve only after trunk/MTP/control/pack budgets
     std::optional<uint32_t> module_id;
+    std::string pci_bus;
+    std::string pipeline_peer_pci;
+    uint32_t pipeline_split_layer=0;
     uint64_t position_base=0;
     RopeOptions rope;
     // --vision (src/program/generate.cpp:2104): --serve takes GENI requests with SVE1 embeddings and M-RoPE.

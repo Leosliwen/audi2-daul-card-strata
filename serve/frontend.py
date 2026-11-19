@@ -555,6 +555,11 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
             kwargs = {"enable_thinking": False}
         elif k == "reasoning_effort" and "enable_thinking" not in kwargs:
             kwargs.update(effort_kwargs(v))
+    ctk = req.get("chat_template_kwargs") or {}
+    if "preserve_thinking" in ctk:
+        if not isinstance(ctk["preserve_thinking"], bool):
+            raise ValueError("chat_template_kwargs.preserve_thinking must be a boolean")
+        kwargs["preserve_thinking"] = ctk["preserve_thinking"]
     return _env_to_user(_late_system_to_user(messages)), tools, kwargs
 
 
